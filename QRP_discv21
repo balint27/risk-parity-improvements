@@ -13,7 +13,7 @@
 #            - CRITICAL FIX (Alignment): Enforced align-before-use on all    #
 #              vectors, eliminating "longer object" & "no names" errors.     #
 #            - CRITICAL FIX (Covariance): Replaced cov engine with new       #
-#              `build_cov_full` to prevent 'subscript out of bounds' errors. #
+#              `build_covariance` to prevent 'subscript out of bounds' errors. #
 #            - FIX (Cash Accounting): Corrected residual cash calculation    #
 #              to distinguish policy vs. actual cash, fixing Excel checks.   #
 #            - FIX (Scaler): Decoupled sleeve caps from vol scaling to       #
@@ -203,61 +203,50 @@ get_price_row <- function(prices_xts, date, universe, on_date_fail = c("prev","e
 # --- START: Hardened Vector Normalization (v160.9.42) ---
 .get_universe <- function(prices_xts) colnames(prices_xts)
 
-.align_named <- function(x,
-                         universe,
-                         assume_if_unnamed = TRUE,
-                         fill = 0,
-                         allow_empty_ok = FALSE,
-                         tag = NULL) {
-  # x: vector or 1-row/1-col matrix/xts we want aligned to 'universe' names
-  nm <- names(x)
-  # If 'x' is a one-row xts/matrix, pull its vector and names
-  if (is.matrix(x) && nrow(x) == 1L) {
-    nm <- colnames(x)
-    x  <- as.numeric(x[1, , drop = TRUE])
-  } else if (is.matrix(x) && ncol(x) == 1L) {
-    nm <- rownames(x)
-    x  <- as.numeric(x[, 1, drop = TRUE])
-  } else if (xts::is.xts(x) && NROW(x) == 1L) {
-    nm <- colnames(x)
-    x  <- as.numeric(coredata(x)[1, , drop = TRUE])
-  }
-
-  # Handle empty inputs explicitly
-  if (length(x) == 0L) {
-    if (!allow_empty_ok) stop(".align_named: empty input and allow_empty_ok = FALSE")
-    out <- rep(fill, length(universe)); names(out) <- universe
-    if (!is.null(tag)) message(sprintf("[ALIGN %s] empty input -> returning %d '%s'", tag, length(universe), as.character(fill)))
-    return(out)
-  }
-
-  # If still no names...
-  if (is.null(nm) || all(is.na(nm)) || !any(nchar(nm) > 0)) {
-    if (!assume_if_unnamed) stop(".align_named: input vector has no names and assume_if_unnamed = FALSE")
-    if (length(x) != length(universe)) stop(sprintf(".align_named: unnamed length %d != universe length %d", length(x), length(universe)))
-    nm <- universe
-  }
-
-  # Normalize to numeric + set names
-  x <- as.numeric(x); names(x) <- nm
-  # Add missing names with 'fill'
-  missing <- setdiff(universe, names(x))
-  if (length(missing) > 0L) x[missing] <- fill
-  # Return in universe order only
-  x <- x[universe]
-  return(x)
+.assert_named <- function(x, nm) {
+  if (is.null(names(x))) stop(sprintf("%s: input has no names", nm))
+  invisible(TRUE)
 }
 
-.row_named <- function(X, i, universe, assume_if_unnamed = TRUE, fill = 0) {
-  row <- coredata(X[i, , drop = FALSE])
-  v <- .align_named(row, universe, assume_if_unnamed = assume_if_unnamed, fill=fill)
-  return(v)
+.align_named <- function(x, universe, fill = 0, label = "align_named") {
+  # Accept named vector or 1-row matrix/xts; return named numeric vector length(universe)
+  if (is.matrix(x) || xts::is.xts(x)) {
+    nm_in <- colnames(if (is.matrix(x)) x else as.matrix(x))
+    x <- as.numeric(x[1, ])
+    if (!is.null(nm_in)) names(x) <- nm_in
+  }
+  if (is.null(names(x))) {
+    # Last-resort: assume same order as universe, but complain (non-fatal) in debug
+    if (length(x) != length(universe)) {
+      stop(sprintf("%s: unnamed vector length %d != universe length %d", label, length(x), length(universe)))
+    }
+    names(x) <- universe
+  } else {
+    # Ensure all universe names exist; fill missing with `fill`
+    miss <- setdiff(universe, names(x))
+    if (length(miss)) {
+      add <- rep(fill, length(miss)); names(add) <- miss
+      x <- c(x, add)
+    }
+    x <- x[universe]
+  }
+  x[is.na(x)] <- fill
+  x_num <- as.numeric(x)
+  names(x_num) <- names(x)
+  return(x_num)
 }
 
-.make_row_xts <- function(w, universe, when) {
-  v <- .align_named(w, universe, assume_if_unnamed = TRUE, fill = 0)
-  mat <- matrix(v, nrow = 1, dimnames = list(NULL, universe))
+# 1xN xts row maker
+.make_row_xts <- function(w, cols, when) {
+  w <- .align_named(w, cols, fill = 0, label = ".make_row_xts")
+  mat <- matrix(w, nrow = 1, dimnames = list(NULL, cols))
   xts::xts(mat, order.by = when)
+}
+
+.row_named <- function(X, i, universe, fill = 0) {
+  row <- coredata(X[i, , drop = FALSE])
+  v <- .align_named(row, universe, fill = fill, label = ".row_named")
+  return(v)
 }
 
 .shape_diag <- function(tag, v, universe) {
@@ -280,7 +269,7 @@ apply_integer_units <- function(w_target, prices_row, equity,
   tgt_dol <- tgt_w_risky * equity
 
   px <- prices_row[risky]
-  px <- .align_named(px, risky, allow_empty_ok = TRUE)
+  px <- .align_named(px, risky, label = "apply_integer_units/px")
 
   units <- floor(tgt_dol / pmax(px, .Machine$double.eps))
   inv_dol <- units * px
@@ -332,6 +321,43 @@ get_asset_vols_full <- function(Sigma_daily, universe, vol_annualize = 252) {
     }
   }
   v
+}
+apply_vol_target_and_leverage <- function(w_raw, Sigma_full, vol_target, vol_annualize = 252,
+                                          gross_cap, cash_name = "CASH", eps = 1e-12) {
+  .assert_named(w_raw, "apply_vol_target_and_leverage/w_raw")
+  nms <- names(w_raw)
+  risky <- setdiff(nms, cash_name)
+
+  # Align Sigma to names
+  Sigma_full <- Sigma_full[nms, nms, drop = FALSE]
+
+  # Port vol on risky block only
+  wr <- w_raw[risky]
+  Sr <- Sigma_full[risky, risky, drop = FALSE]
+  var_d <- as.numeric(t(wr) %*% Sr %*% wr)
+  if (!is.finite(var_d) || var_d <= 0) {
+    # no risk -> all cash
+    w_out <- setNames(rep(0, length(nms)), nms)
+    w_out[cash_name] <- 1
+    return(w_out)
+  }
+  vol_a <- sqrt(var_d * vol_annualize)
+  s_vol <- vol_target / max(vol_a, eps)
+
+  # Pre-cap scaling
+  w_scaled <- w_raw
+  w_scaled[risky] <- wr * s_vol
+
+  # Enforce gross cap on risky exposures only
+  gross_risky <- sum(abs(w_scaled[risky]))
+  if (is.finite(gross_cap) && gross_risky > gross_cap && gross_risky > 0) {
+    w_scaled[risky] <- w_scaled[risky] * (gross_cap / gross_risky)
+  }
+
+  # Net-to-one via policy cash: cash = 1 - sum(non-cash)
+  w_scaled[cash_name] <- 1 - sum(w_scaled[risky])
+  w_scaled[abs(w_scaled) < eps] <- 0
+  return(w_scaled)
 }
 # --- END: Hardened Vol Scaler & Diagnostics ---
 
@@ -536,28 +562,30 @@ ts_returns <- function(price_xts, method = c("discrete","log")) {
   r <- r[-1,]; ensure_date_index(r)
 }
 
-build_cov_full <- function(R_window, universe, cash_name = "CASH") {
+build_covariance <- function(R_window, universe, cash_name = "CASH", method = "sample", lambda = 0.94) {
+  # R_window: xts of daily returns, columns subset of universe (never include CASH in returns)
+  # Returns a square numeric matrix with row/col=universe; CASH row/col all zeros.
+
+  # Start with sample covariance on intersecting risky names
   risky <- setdiff(universe, cash_name)
-  Sigma_risky <- suppressWarnings(stats::cov(coredata(R_window[, risky, drop = FALSE]),
-                                             use = "pairwise.complete.obs"))
-  # Make it a square matrix with proper dimnames, even if single asset
-  if (is.null(dim(Sigma_risky))) {
-    Sigma_risky <- matrix(Sigma_risky, nrow = length(risky), ncol = length(risky),
-                          dimnames = list(risky, risky))
+  have  <- intersect(risky, colnames(R_window))
+  if (length(have) > 0) {
+    S <- stats::cov(R_window[, have, drop = FALSE], use = "pairwise.complete.obs")
+  } else {
+    S <- matrix(0, 0, 0)
   }
-  # Replace non-finite with diagonal fallback
-  bad <- !is.finite(Sigma_risky)
-  if (any(bad)) {
-    diag_vals <- diag(Sigma_risky)
-    diag_vals[is.na(diag_vals)] <- 0 # If even the diagonal is NA
-    diag(Sigma_risky) <- pmax(diag_vals, 1e-12)
-    Sigma_risky[bad]  <- 0
-  }
-  
-  # Add CASH as zero-variance rows/cols
-  Sigma <- matrix(0, nrow = length(universe), ncol = length(universe),
-                  dimnames = list(universe, universe))
-  Sigma[risky, risky] <- Sigma_risky
+
+  # Expand to full risky; fill missing assets with diagonal shrink to median var
+  S_full <- matrix(0, length(risky), length(risky), dimnames = list(risky, risky))
+  if (length(have) > 0) S_full[have, have] <- S
+
+  # If any diagonal is zero (or NA), set small variance to avoid degeneracy
+  diag(S_full)[!is.finite(diag(S_full)) | diag(S_full) <= 0] <- median(diag(S_full)[diag(S_full) > 0], na.rm = TRUE)
+  diag(S_full)[!is.finite(diag(S_full))] <- 1e-8
+
+  # Stitch CASH as zero row/col
+  Sigma <- matrix(0, length(universe), length(universe), dimnames = list(universe, universe))
+  Sigma[risky, risky] <- S_full
   return(Sigma)
 }
 
@@ -688,11 +716,17 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
   calc_date <- index(R)[rebal_idx]
   target_start_date <- snap_to_next_trading_day(calc_date + 1, index(R))
   rebal_date_char <- as.character(calc_date)
-  
+
   window <- (rebal_idx - mc$lookback + 1L):rebal_idx; window <- window[window > 0]
   r_win_full <- R[window, universe, drop = FALSE]
-  
+
   cash_asset <- mc$cash_asset_name %||% "CASH"
+
+  # Always initialize sleeve artifacts so later code can safely inspect them
+  sleeve_ret_list   <- list()
+  num_active_sleeves <- 0L
+  active_sleeve_mask <- rep(FALSE, length(universe))
+  names(active_sleeve_mask) <- universe
   
   if (NROW(na.omit(r_win_full)) < 25) {
     w_final <- setNames(numeric(length(universe)), universe); w_final[cash_asset] <- 1
@@ -741,13 +775,17 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
     return(list(target_weights = target_weights, log_entry = data.frame(Date=target_start_date, Type="DE-RISK", Details="Not enough eligible assets after filtering."), diag_data = diag_data, audit_df = NULL, vix_event_log = NULL, asset_annual_vol = asset_vols, eligible_assets = character(0)))
   }
   
-  Sigma_full <- build_cov_full(r_win_full, universe, cash_asset)
+  Sigma_full <- build_covariance(r_win_full, universe, cash_name = cash_asset, method = mc$cov_method, lambda = mc$cov_lambda)
+  if (!all(rownames(Sigma_full) == universe) || !all(colnames(Sigma_full) == universe)) {
+    stop("[COV] Sigma_full is not aligned to universe")
+  }
   asset_vols <- get_asset_vols_full(Sigma_full, universe, mc$vol_annualize)
   
   active_class_map <- class_map[eligible_assets]
   sleeves <- split(eligible_assets, active_class_map)
   sleeve_names <- names(sleeves)
   num_active_sleeves <- length(sleeve_names)
+  active_sleeve_mask[names(active_sleeve_mask) %in% unlist(sleeves)] <- TRUE
 
   log_entry <- data.frame(Date=target_start_date, Type="Rebalance", Details="Standard rebalance.")
   
@@ -770,8 +808,9 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
       colnames(sleeve_ret) <- sleeve_name
       return(sleeve_ret)
     })
+    sleeve_ret_list <- sleeve_returns_list
     sleeve_returns <- do.call(merge, sleeve_ret_list[!sapply(sleeve_ret_list, is.null)])
-    sleeve_cov <- build_cov_full(sleeve_returns, colnames(sleeve_returns), cash_name=NULL)
+    sleeve_cov <- build_covariance(sleeve_returns, colnames(sleeve_returns), cash_name = NULL)
     sleeve_risk_budgets <- run_risk_parity_optimizer(sleeve_cov)
   }
   
@@ -785,17 +824,20 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
     }
   }
 
-  w_raw_aligned <- .align_named(w_raw, universe, allow_empty_ok = TRUE, tag = "w_raw_rp")
-  
+  w_raw_aligned <- .align_named(w_raw, universe, fill = 0, label = "w_raw_rp")
+
   # --- START: Scaler Logic (v160.9.42) ---
   vix_today <- if (!is.null(vix_series)) as.numeric(vix_series[rebal_date_char]) else NA
   vix_event_log <- NULL
-  
+
   risky_names <- eligible_assets
-  
-  v_d <- as.numeric(t(w_raw_aligned[risky_names]) %*% Sigma_full[risky_names, risky_names, drop = FALSE] %*% w_raw_aligned[risky_names])
-  vol_pre <- sqrt(max(v_d, 0) * mc$vol_annualize)
-  s_vol <- if (vol_pre > 1e-12) mc$vol_target / vol_pre else 0
+  risky_block <- setdiff(universe, cash_asset)
+
+  vol_pre <- {
+    v_d <- as.numeric(t(w_raw_aligned[risky_names]) %*% Sigma_full[risky_names, risky_names, drop = FALSE] %*% w_raw_aligned[risky_names])
+    sqrt(max(v_d, 0) * mc$vol_annualize)
+  }
+  s_vol <- if (is.finite(vol_pre) && vol_pre > 1e-12) mc$vol_target / vol_pre else 0
 
   sleeve_cap_policy <- get_sleeve_limit(num_active_sleeves, mc$sleeve_derisking_rules)
   layoff_cap <- if (isTRUE(mc$high_vix_layoff$enabled) && !is.na(vix_today) && vix_today > mc$high_vix_layoff$vix_threshold) {
@@ -803,21 +845,30 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
     } else Inf
   gross_cap  <- mc$max_leverage
 
-  s_used <- min(s_vol, gross_cap, layoff_cap, na.rm = TRUE)
-  
-  w_scaled <- w_raw_aligned
-  w_scaled[risky_names] <- w_raw_aligned[risky_names] * s_used
+  cap_limit <- min(gross_cap, sleeve_cap_policy, layoff_cap, na.rm = TRUE)
+  s_used <- min(s_vol, cap_limit)
+  binding_reason <- "vol"
+  if (abs(s_used - cap_limit) < 1e-8 && abs(cap_limit - sleeve_cap_policy) < 1e-8) binding_reason <- "sleeve_policy"
+  else if (abs(s_used - cap_limit) < 1e-8 && abs(cap_limit - layoff_cap) < 1e-8) binding_reason <- "layoff"
+  else if (abs(s_used - cap_limit) < 1e-8 && abs(cap_limit - gross_cap) < 1e-8) binding_reason <- "gross"
 
-  # Recenter to sleeve policy
-  risky_g <- sum(abs(w_scaled[risky_names]))
-  if (is.finite(sleeve_cap_policy) && risky_g > sleeve_cap_policy && risky_g > 1e-9) {
-      w_scaled[risky_names] <- w_scaled[risky_names] * (sleeve_cap_policy / risky_g)
+  effective_vol_target <- if (s_vol > 0) mc$vol_target * (s_used / s_vol) else 0
+  w_scaled <- apply_vol_target_and_leverage(w_raw_aligned, Sigma_full, effective_vol_target, mc$vol_annualize,
+                                            gross_cap = gross_cap, cash_name = cash_asset)
+
+  gross_risky <- sum(abs(w_scaled[risky_block]))
+  if (is.finite(sleeve_cap_policy) && gross_risky > sleeve_cap_policy && gross_risky > 0) {
+    w_scaled[risky_block] <- w_scaled[risky_block] * (sleeve_cap_policy / gross_risky)
+    gross_risky <- sum(abs(w_scaled[risky_block]))
+    binding_reason <- "sleeve_policy"
   }
-  
-  policy_cash <- max(0, 1 - sum(w_scaled[risky_names]))
-  if(cash_asset %in% names(w_scaled)) w_scaled[cash_asset] <- policy_cash
-
-  binding_reason <- if(abs(s_used-s_vol) < 1e-6) "vol" else if(abs(s_used-layoff_cap) < 1e-6) "layoff" else "gross"
+  if (is.finite(layoff_cap) && gross_risky > layoff_cap && gross_risky > 0) {
+    w_scaled[risky_block] <- w_scaled[risky_block] * (layoff_cap / gross_risky)
+    gross_risky <- sum(abs(w_scaled[risky_block]))
+    binding_reason <- "layoff"
+  }
+    w_scaled[cash_asset] <- 1 - sum(w_scaled[risky_block])
+    policy_cash <- w_scaled[cash_asset]
 
   message(sprintf("[SCALER %s] vol_pre=%.4f | s_vol=%.3f | caps: gross=%.2f sleeve_policy=%.2f layoff=%s -> s_used=%.3f (binding=%s)",
     rebal_date_char, vol_pre, s_vol, gross_cap, sleeve_cap_policy,
@@ -829,7 +880,7 @@ calculate_target_weights <- function(prices, R, rebal_idx, previous_weights, mas
   }
   
   target_weights <- .make_row_xts(w_scaled, universe, target_start_date)
-  final_risk_weights_vec <- .align_named(w_scaled, risky_names, allow_empty_ok = TRUE)
+  final_risk_weights_vec <- .align_named(w_scaled, risky_names, fill = 0, label = "final_risk_weights")
   
   Sigma_eligible <- Sigma_full[risky_names, risky_names, drop=FALSE]
   port_var_diag_final <- if(length(final_risk_weights_vec) > 0) as.numeric(t(final_risk_weights_vec) %*% Sigma_eligible %*% final_risk_weights_vec) else 0
@@ -952,46 +1003,53 @@ risk_parity_backtest <- function(prices, master_controls) {
         if (!is.null(calc_result)) {
           trade_date <- as.Date(index(calc_result$target_weights))
           w_target_vec <- .align_named(coredata(calc_result$target_weights), universe)
+          message(sprintf("[SHAPE %s] target(len=%d, named=%s) | universe(len=%d)",
+                          as.Date(trade_date), length(w_target_vec), if (is.null(names(w_target_vec))) "no" else "yes", length(universe)))
           .shape_diag("target_vec_initial", w_target_vec, universe)
-            
+
           w_after_vec <- w_target_vec
-          
+
           if (isTRUE(mc$no_trade_bands$enabled)) {
             ntz <- mc$no_trade_bands
-            asset_vols <- .align_named(calc_result$asset_annual_vol, universe, allow_empty_ok = TRUE, tag = "ntz_vols")
-            band <- ntz$alpha * (asset_vols / (ntz$sigma_ref %||% 0.15))
-            band <- pmin(pmax(band, ntz$min_abs), ntz$max_abs)
-            band <- .align_named(band, universe)
-            
-            w_current_aligned <- .align_named(w_current, universe, tag = "ntz_w_current")
-            drift_vec <- w_target_vec - w_current_aligned
-            drift_abs <- abs(drift_vec)
-            breach <- drift_abs > band
-            
-            w_exec <- w_current_aligned 
-            if (any(breach, na.rm=TRUE)) {
-              if (identical(ntz$snap_mode, "target")) {
-                w_exec[breach] <- w_target_vec[breach]
-              } else {
-                over <- (w_current_aligned > w_target_vec) & breach
-                under <- (w_current_aligned < w_target_vec) & breach
-                w_exec[over]  <- w_target_vec[over]  + band[over]
-                w_exec[under] <- w_target_vec[under] - band[under]
+            asset_vols <- .align_named(calc_result$asset_annual_vol, universe, fill = 0, label = "ntz_vols")
+            band_vec <- ntz$alpha * (asset_vols / (ntz$sigma_ref %||% 0.15))
+            band_vec <- pmin(pmax(band_vec, ntz$min_abs), ntz$max_abs)
+
+            if (any(is.na(w_target_vec)))  message("[NTZ] WARNING: NA in w_target_vec; will skip NA indices.")
+            if (any(!names(w_target_vec) %in% universe)) message("[NTZ] WARNING: target has names outside universe.")
+
+            w_exec       <- .align_named(w_current, universe, fill = 0, label = "w_exec@NTZ")
+            w_target_vec <- .align_named(w_target_vec, universe, fill = 0, label = "w_target_vec@NTZ")
+            band_vec     <- .align_named(band_vec, universe, fill = Inf, label = "band_vec@NTZ")
+
+            drift_vec <- w_target_vec - w_exec
+            drift_vec[is.na(drift_vec)] <- 0
+
+            breach <- abs(drift_vec) > band_vec
+            breach[is.na(breach)] <- FALSE
+
+            if (any(breach)) {
+              idx <- which(breach)
+              rhs <- w_target_vec[idx]
+              good <- !is.na(rhs)
+              if (any(good)) {
+                w_exec[idx[good]] <- rhs[good]
               }
+              if (any(!good)) message(sprintf("[NTZ %s] skipped %d NA targets.", as.Date(trade_date), sum(!good)))
             }
-            w_exec <- .align_named(w_exec, universe, tag="ntz_w_exec")
+
             risky_sum_exec <- sum(w_exec[setdiff(names(w_exec), cash_asset)], na.rm = TRUE)
             w_exec[cash_asset] <- 1 - risky_sum_exec
             w_after_vec <- w_exec
             message(sprintf("[NTZ %s] Trades on %d assets. Max drift/band: %.4f/%.4f.",
-                as.character(trade_date), sum(breach, na.rm=TRUE), max(drift_abs, na.rm=TRUE), max(band, na.rm=TRUE)))
+                as.character(trade_date), sum(breach, na.rm=TRUE), max(abs(drift_vec), na.rm=TRUE), max(band_vec, na.rm=TRUE)))
           }
           
           # --- START: Integer Sizing & Audit (v160.9.42) ---
           w_after_vec <- .align_named(w_after_vec, universe)
           int_applied <- FALSE; int_msg <- NA_character_; w_after_vec_int <- w_after_vec
           
-          policy_cash_weight <- calc_result$diag_data$binding_diag$policy_cash %||% 0
+          policy_cash_weight <- 1 - sum(w_after_vec[setdiff(universe, cash_asset)], na.rm = TRUE)
 
           if (isTRUE(mc$integer_sizing$enabled)) {
               pr_vec <- get_price_row(prices, trade_date, universe, on_date_fail = "prev", cash_name = cash_asset)
